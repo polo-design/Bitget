@@ -1,39 +1,26 @@
-// server.js — Bitget-ready webhook bot (ccxt) — final with placeMarketOrder
+// server.js — Bitget futures: only longs (open long on BUY, close long on SELL)
 import express from "express";
 import bodyParser from "body-parser";
 import ccxt from "ccxt";
-import crypto from "crypto";
 
 const app = express();
-
-// parse bodies as text and json
+app.use(bodyParser.json());
 app.use(bodyParser.text({ type: "*/*" }));
-app.use(bodyParser.json({ type: "application/json", limit: "100kb" }));
 
-// ---------- CONFIG from ENV ----------
+// ===== CONFIG (ENV) =====
 const EXCHANGE_ID = process.env.EXCHANGE_ID || "bitget";
-const EXCHANGE_TYPE = (process.env.EXCHANGE_TYPE || "swap").toLowerCase(); // 'swap' or 'spot'
 const API_KEY = process.env.EXCHANGE_KEY || "";
 const API_SECRET = process.env.EXCHANGE_SECRET || "";
-const API_PASSWORD = process.env.EXCHANGE_PASSPHRASE || ""; // passphrase/password
-const SAFETY_BUFFER = parseFloat(process.env.SAFETY_BUFFER || "1.0"); // 1.0 = 100% capital
-const MIN_ORDER_AMOUNT = parseFloat(process.env.MIN_ORDER_AMOUNT || "0.00000001");
+const API_PASSWORD = process.env.EXCHANGE_PASSPHRASE || ""; // passphrase
 const DEFAULT_SYMBOL = process.env.DEFAULT_SYMBOL || "BTC/USDT:USDT";
-const USE_SANDBOX = (process.env.SANDBOX || "false").toLowerCase() === "true";
-
-// leverage options (optional)
-const USE_LEVERAGE_FOR_SWAPS = (process.env.USE_LEVERAGE_FOR_SWAPS || "false").toLowerCase() === "true";
-const LEVERAGE = parseFloat(process.env.LEVERAGE || "1");
-
-// webhook security (optional)
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || ""; // if set, TradingView must send HMAC in header
-const WEBHOOK_HEADER = process.env.WEBHOOK_HEADER || "x-webhook-signature";
+const EXCHANGE_TYPE = (process.env.EXCHANGE_TYPE || "swap").toLowerCase(); // swap expected
+const MIN_AMOUNT = parseFloat(process.env.MIN_ORDER_AMOUNT || "0.00000001");
 
 if (!API_KEY || !API_SECRET) {
-  console.warn("WARNING: EXCHANGE_KEY / EXCHANGE_SECRET not set — trading will fail until set.");
+  console.warn("⚠️ WARNING: EXCHANGE_KEY / EXCHANGE_SECRET not set in ENV");
 }
 
-// ---------- INIT EXCHANGE ----------
+// ===== INIT EXCHANGE =====
 let exchange;
 try {
   const ExchangeClass = ccxt[EXCHANGE_ID];
@@ -41,40 +28,22 @@ try {
     console.error("Exchange class not found in ccxt:", EXCHANGE_ID);
     process.exit(1);
   }
-  const opts = {
+  exchange = new ExchangeClass({
     apiKey: API_KEY,
     secret: API_SECRET,
     password: API_PASSWORD || undefined,
     enableRateLimit: true,
-    options: {}
-  };
-  if (EXCHANGE_ID === "bitget") {
-    opts.options.defaultType = EXCHANGE_TYPE === "spot" ? "spot" : "swap";
-  }
-  exchange = new ExchangeClass(opts);
+    options: { defaultType: EXCHANGE_TYPE === "spot" ? "spot" : "swap" }
+  });
+  // optional hint
+  try { exchange.options.defaultType = exchange.options.defaultType || (EXCHANGE_TYPE === "spot" ? "spot" : "swap"); } catch(e){}
 
-  try {
-    if (!exchange.options) exchange.options = {};
-    exchange.options.defaultType = opts.options.defaultType;
-    exchange.options.version = "v3";
-  } catch (e) {
-    console.warn("Could not set exchange.options hints:", e && e.toString ? e.toString() : e);
-  }
-
-  if (USE_SANDBOX && typeof exchange.setSandboxMode === "function") {
-    try {
-      exchange.setSandboxMode(true);
-      console.log("Sandbox mode enabled for", EXCHANGE_ID);
-    } catch (e) {
-      console.warn("Could not enable sandbox mode:", e && e.toString ? e.toString() : e);
-    }
-  }
 } catch (e) {
   console.error("Failed to init exchange:", e && e.toString ? e.toString() : e);
   process.exit(1);
 }
 
-// ---------- MARKETS LOADER ----------
+// ===== Load markets =====
 let marketsReady = false;
 async function loadMarkets(retry = 0) {
   try {
@@ -82,284 +51,162 @@ async function loadMarkets(retry = 0) {
     marketsReady = true;
     console.log("Markets loaded for", EXCHANGE_ID, "type:", EXCHANGE_TYPE);
   } catch (err) {
-    console.error("Failed to load markets:", err && err.toString ? err.toString() : err);
+    console.error("loadMarkets error:", err && err.toString ? err.toString() : err);
     if (retry < 3) {
-      console.log("Retrying loadMarkets in 2s (attempt", retry + 1, ")...");
-      await new Promise((r) => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 2000));
       return loadMarkets(retry + 1);
     }
   }
 }
 loadMarkets();
 
-// ---------- DUPLICATE GUARD (in-memory, short TTL) ----------
-const recentPayloads = new Map();
-const DUP_TTL_MS = 30 * 1000;
-function isDuplicate(key) {
-  const now = Date.now();
-  for (const [k, t] of recentPayloads.entries()) {
-    if (now - t > DUP_TTL_MS) recentPayloads.delete(k);
-  }
-  if (recentPayloads.has(key)) return true;
-  recentPayloads.set(key, now);
-  return false;
+// ===== Helpers =====
+function normalizeSymbol(s) {
+  if (!s) return DEFAULT_SYMBOL;
+  let sym = String(s).trim();
+  sym = sym.replace("-", "/").replace("_", "/");
+  if (!sym.includes("/") && sym.length >= 6) sym = sym.slice(0,3) + "/" + sym.slice(3);
+  return sym.toUpperCase();
 }
 
-// ---------- HELPERS ----------
-function normalizeSymbol(inputSymbol) {
-  if (!inputSymbol) return null;
-  let s = String(inputSymbol).trim();
-  s = s.replace("-", "/").replace("_", "/");
-  if (!s.includes("/") && s.length >= 6) {
-    s = s.slice(0, 3) + "/" + s.slice(3);
-  }
-  return s.toUpperCase();
-}
-
-function computeHmac(secret, payloadString) {
-  return crypto.createHmac("sha256", secret).update(payloadString).digest("hex");
-}
-
-async function computeAllInAmounts(marketSymbol) {
+async function getPriceAndBalances(symbol) {
   if (!marketsReady) await loadMarkets();
-  let symbol = marketSymbol;
-
-  if (exchange.markets && !(symbol in exchange.markets)) {
-    const tries = [symbol, symbol.replace("/", ""), symbol.replace("/", "-"), symbol.replace("/", "").replace("-", "")];
-    const found = Object.keys(exchange.markets || {}).find(k => tries.includes(k) || tries.includes(k.replace("/", "")));
-    if (found) symbol = found;
-  }
-
   const market = exchange.markets && exchange.markets[symbol] ? exchange.markets[symbol] : null;
-
-  let base, quote;
-  if (market) { base = market.base; quote = market.quote; }
-  else { const parts = symbol.split("/"); base = parts[0]; quote = parts[1]; }
-
-  const bal = await exchange.fetchBalance();
-  const freeQuote = (bal[quote] && (bal[quote].free || bal[quote].total)) ? (bal[quote].free || bal[quote].total) : 0;
-  const freeBase  = (bal[base]  && (bal[base].free  || bal[base].total)) ? (bal[base].free  || bal[base].total) : 0;
-
-  const ticker = await exchange.fetchTicker(symbol).catch(e => {
-    console.warn("fetchTicker failed for", symbol, e && e.toString ? e.toString() : e);
-    return null;
-  });
+  // fetch balance
+  const balance = await exchange.fetchBalance();
+  // price (ticker)
+  const ticker = await exchange.fetchTicker(symbol).catch(e => { console.warn("fetchTicker failed", e && e.toString ? e.toString() : e); return null; });
   const price = ticker && (ticker.last || ticker.close || ticker.bid) ? (ticker.last || ticker.close || ticker.bid) : null;
-  if (!price) throw new Error("Cannot fetch price for symbol " + symbol);
+  return { market, balance, price };
+}
 
-  let rawBuyAmount;
-  if (EXCHANGE_TYPE === 'swap' && USE_LEVERAGE_FOR_SWAPS) {
-    rawBuyAmount = (freeQuote * SAFETY_BUFFER * LEVERAGE) / price;
-  } else {
-    rawBuyAmount = (freeQuote * SAFETY_BUFFER) / price;
-  }
-  const rawSellAmount = freeBase * SAFETY_BUFFER;
+// Try to compute buy amount = all-in on quote (USDT) / price
+async function computeBuyAmount(symbol) {
+  const { market, balance, price } = await getPriceAndBalances(symbol);
+  if (!price) throw new Error("Cannot fetch price for " + symbol);
+  const quote = market ? market.quote : (symbol.split("/")[1]);
+  const freeQuote = (balance && balance.free && balance.free[quote]) ? balance.free[quote] : 0;
+  let qty = freeQuote / price;
+  try { qty = parseFloat(exchange.amountToPrecision(symbol, qty)); } catch(e){ /* fallthrough */ }
+  return { qty, price, freeQuote };
+}
 
-  let buyAmount = rawBuyAmount;
-  let sellAmount = rawSellAmount;
+// Try to compute sell amount = position size for long (fetchPositions) or free base
+async function computeSellAmount(symbol) {
+  // prefer fetchPositions if available (for futures)
   try {
-    if (exchange.amountToPrecision) {
-      if (symbol in (exchange.markets || {})) {
-        buyAmount = parseFloat(exchange.amountToPrecision(symbol, buyAmount));
-        sellAmount = parseFloat(exchange.amountToPrecision(symbol, sellAmount));
-      } else {
-        const found = Object.keys(exchange.markets || {}).find(k => k.replace("/", "") === symbol.replace("/", ""));
-        if (found) {
-          buyAmount = parseFloat(exchange.amountToPrecision(found, buyAmount));
-          sellAmount = parseFloat(exchange.amountToPrecision(found, sellAmount));
-          symbol = found;
+    if (typeof exchange.fetchPositions === "function") {
+      const pos = await exchange.fetchPositions([symbol]).catch(e => { console.warn("fetchPositions failed:", e && e.toString ? e.toString() : e); return null; });
+      if (pos && Array.isArray(pos) && pos.length > 0) {
+        // find long position (depends on exchange response)
+        // try to extract size/positionAmt/positionSize
+        for (const p of pos) {
+          // p may contain fields: contracts, size, positionAmt, amount, notional
+          const sizeCandidates = [p.contracts, p.size, p.amount, p.positionAmt, p.position_size, p[ 'position' ]].filter(Boolean);
+          if (sizeCandidates.length > 0) {
+            const raw = Number(sizeCandidates[0]);
+            if (!isNaN(raw) && raw > 0) {
+              let qty = raw;
+              try { qty = parseFloat(exchange.amountToPrecision(symbol, qty)); } catch(e){}
+              return { qty, from: "position", raw };
+            }
+          }
         }
       }
     }
   } catch (e) {
-    console.warn("Precision rounding failed:", e && e.toString ? e.toString() : e);
+    console.warn("fetchPositions exception:", e && e.toString ? e.toString() : e);
   }
 
-  if (market && market.limits && market.limits.amount && market.limits.amount.min) {
-    const minAmt = market.limits.amount.min;
-    if (!isNaN(buyAmount) && buyAmount > 0 && buyAmount < minAmt) buyAmount = 0;
-    if (!isNaN(sellAmount) && sellAmount > 0 && sellAmount < minAmt) sellAmount = 0;
-  }
-
-  return { symbol, base, quote, price, buyAmount, sellAmount, freeQuote, freeBase, rawBuyAmount, rawSellAmount };
+  // fallback: use free base balance
+  const { market, balance } = await getPriceAndBalances(symbol);
+  const base = market ? market.base : (symbol.split("/")[0]);
+  const freeBase = (balance && balance.free && balance.free[base]) ? balance.free[base] : 0;
+  let qty = freeBase;
+  try { qty = parseFloat(exchange.amountToPrecision(symbol, qty)); } catch(e){}
+  return { qty, from: "balance", freeBase };
 }
 
-// attempt to set leverage (best-effort)
-async function setLeverageIfNeeded(symbol) {
-  if (EXCHANGE_TYPE !== 'swap' || !USE_LEVERAGE_FOR_SWAPS || !LEVERAGE || LEVERAGE <= 1) return;
-  try {
-    if (typeof exchange.setLeverage === 'function') {
-      await exchange.setLeverage(LEVERAGE, symbol);
-      console.log("setLeverage called via ccxt.setLeverage for", symbol, "=>", LEVERAGE);
-    } else {
-      console.log("exchange.setLeverage not available on this ccxt build — skipping explicit setLeverage");
-    }
-  } catch (e) {
-    console.warn("setLeverage failed (non-fatal):", e && e.toString ? e.toString() : e);
-  }
-}
-
-// robust market order placer (tries createMarketOrder, then fallback to createOrder('market'))
-async function placeMarketOrder(symbol, side, amount) {
-  const params = {};
+// robust market order placer with fallback
+async function placeMarketOrder(symbol, side, amount, extraParams = {}) {
+  const params = Object.assign({}, extraParams);
   if (EXCHANGE_ID === 'bitget' && EXCHANGE_TYPE === 'swap') {
     params.orderType = 'market';
     params.type = 'market';
   }
-
   try {
     if (typeof exchange.createMarketOrder === 'function') {
       return await exchange.createMarketOrder(symbol, side, amount, params);
     }
   } catch (err) {
-    console.warn("createMarketOrder failed, falling back to createOrder('market'):", err && err.toString ? err.toString() : err);
+    console.warn("createMarketOrder failed, fallback to createOrder('market'):", err && err.toString ? err.toString() : err);
   }
-
-  try {
-    return await exchange.createOrder(symbol, 'market', side, amount, undefined, params);
-  } catch (err) {
-    throw err;
-  }
+  // fallback
+  return await exchange.createOrder(symbol, 'market', side, amount, undefined, params);
 }
 
-// ---------- ENDPOINTS ----------
-app.get("/", (_req, res) => res.send(`${EXCHANGE_ID} Bot LIVE`));
-
-app.get("/markets", async (_req, res) => {
-  try {
-    if (!marketsReady) await loadMarkets();
-    const mk = exchange.markets || {};
-    const list = Object.keys(mk).map(k => {
-      const m = mk[k];
-      return { key: k, id: m.id || null, base: m.base || null, quote: m.quote || null, type: m.type || null, info: m.info || null, precision: m.precision || null, limits: m.limits || null };
-    });
-    return res.json({ count: list.length, markets: list });
-  } catch (err) {
-    console.error("markets endpoint error:", err && err.toString ? err.toString() : err);
-    return res.status(500).json({ error: err && err.toString ? err.toString() : String(err) });
-  }
-});
-
-app.get("/balance", async (_req, res) => {
-  try {
-    const balances = await exchange.fetchBalance();
-    return res.json({ balances });
-  } catch (err) {
-    console.error("balance error:", err && err.toString ? err.toString() : err);
-    return res.status(500).json({ error: err && err.toString ? err.toString() : String(err) });
-  }
-});
+// ===== Endpoints =====
+app.get("/", (_req, res) => res.send(`${EXCHANGE_ID} long-only bot LIVE`));
 
 app.post("/webhook", async (req, res) => {
   try {
-    const rawText = (typeof req.body === "string") ? req.body : JSON.stringify(req.body || {});
-    if (WEBHOOK_SECRET) {
-      const sig = (req.headers[WEBHOOK_HEADER] || req.headers[WEBHOOK_HEADER.toLowerCase()] || "").toString();
-      const computed = computeHmac(WEBHOOK_SECRET, rawText);
-      if (!sig) {
-        console.warn("Missing webhook signature header:", WEBHOOK_HEADER);
-        return res.status(401).json({ error: "missing_signature" });
-      }
-      if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(computed))) {
-        console.warn("Invalid webhook signature", { got: sig, expected: computed });
-        return res.status(401).json({ error: "invalid_signature" });
-      }
-    }
-
-    const dupKey = crypto.createHash("sha256").update(rawText).digest("hex");
-    if (isDuplicate(dupKey)) {
-      console.log("Duplicate webhook ignored");
-      return res.status(200).json({ ok: true, duplicate: true });
-    }
-
+    // parse payload JSON or plain text
     let payload = {};
     if (req.is("application/json") && typeof req.body === "object") {
       payload = req.body;
     } else {
-      const text = rawText.trim();
-      try {
-        payload = JSON.parse(text);
-      } catch (e) {
+      const text = (req.body || "").toString().trim();
+      try { payload = JSON.parse(text); } catch(e) {
         const parts = text.split(/\s+/).filter(Boolean);
         if (parts.length === 0) return res.status(400).json({ error: "Empty payload" });
-        const action = parts[0].toLowerCase();
-        if (action !== "buy" && action !== "sell") return res.status(400).json({ error: "Unknown action" });
-        const symbol = parts[1] ? normalizeSymbol(parts[1]) : DEFAULT_SYMBOL;
-        payload = { action, symbol };
+        payload.action = parts[0].toLowerCase();
+        payload.symbol = parts[1] ? parts[1] : DEFAULT_SYMBOL;
       }
     }
 
     const action = (payload.action || "").toLowerCase();
-    let symbol = payload.symbol ? normalizeSymbol(payload.symbol) : DEFAULT_SYMBOL;
+    const symbol = normalizeSymbol(payload.symbol || DEFAULT_SYMBOL);
 
     if (!action || (action !== "buy" && action !== "sell")) return res.status(400).json({ error: "Action must be buy or sell" });
     if (!symbol) return res.status(400).json({ error: "Missing symbol" });
 
     if (!marketsReady) await loadMarkets();
 
-    const amounts = await computeAllInAmounts(symbol);
-
-    console.log("Webhook:", action, "symbol:", amounts.symbol, "computed:", { buyAmount: amounts.buyAmount, sellAmount: amounts.sellAmount, price: amounts.price, freeQuote: amounts.freeQuote, freeBase: amounts.freeBase, rawBuyAmount: amounts.rawBuyAmount });
-
-    if (!API_KEY || !API_SECRET) {
-      return res.status(500).json({ error: "API keys not set in environment" });
-    }
-
-    const market = exchange.markets && exchange.markets[amounts.symbol] ? exchange.markets[amounts.symbol] : null;
-    console.log("Market check:", { symbol: amounts.symbol, marketType: market && market.type, limits: market && market.limits, precision: market && market.precision });
-
-    if (EXCHANGE_TYPE === 'swap' && market && market.type !== 'swap') {
-      console.error("Refusing to place order: market is not swap as expected", amounts.symbol, market.type);
-      return res.status(400).json({ error: "market_type_mismatch", marketType: market.type });
-    }
-
-    await setLeverageIfNeeded(amounts.symbol);
+    console.log("Received webhook:", action, symbol);
 
     if (action === "buy") {
-      const qty = parseFloat(amounts.buyAmount);
-      console.log("Computed buy qty:", qty);
-      if (isNaN(qty) || qty <= MIN_ORDER_AMOUNT) {
-        console.error("Computed buy size too small or invalid", { qty, MIN_ORDER_AMOUNT });
-        return res.status(400).json({ error: "Computed buy size too small", qty });
+      // compute buy qty (all-in)
+      const { qty, price, freeQuote } = await computeBuyAmount(symbol);
+      console.log("Computed BUY qty:", { qty, price, freeQuote });
+      if (!qty || isNaN(qty) || qty <= MIN_AMOUNT) {
+        return res.status(400).json({ error: "Buy amount too small or zero", qty });
       }
-
-      try {
-        const order = await placeMarketOrder(amounts.symbol, "buy", qty);
-        console.log("Buy order full response:", order);
-        try { const openOrders = await exchange.fetchOpenOrders(amounts.symbol); console.log("Open orders after buy:", openOrders); } catch(e){ console.warn("fetchOpenOrders failed:", e && e.toString ? e.toString() : e); }
-        try { if (typeof exchange.fetchPositions === "function") { const pos = await exchange.fetchPositions([amounts.symbol]); console.log("Positions after buy (fetchPositions):", pos); } } catch(e){ console.warn("fetchPositions failed:", e && e.toString ? e.toString() : e); }
-        try { const balAfter = await exchange.fetchBalance(); console.log("Balance after buy (free):", balAfter.free); } catch(e){ console.warn("fetchBalance failed after buy:", e && e.toString ? e.toString() : e); }
-        return res.json({ status: "ok", action: "buy", order });
-      } catch (e) {
-        console.error("createMarketOrder BUY failed:", e && e.toString ? e.toString() : e);
-        return res.status(500).json({ error: "order_failed", detail: e && e.toString ? e.toString() : String(e) });
+      // place market buy
+      const order = await placeMarketOrder(symbol, "buy", qty);
+      console.log("Buy order response:", order);
+      return res.json({ ok: true, action: "buy", order });
+    } else { // sell -> close long
+      const sellInfo = await computeSellAmount(symbol);
+      const qty = parseFloat(sellInfo.qty);
+      console.log("Computed SELL qty:", sellInfo);
+      if (!qty || isNaN(qty) || qty <= MIN_AMOUNT) {
+        return res.status(400).json({ error: "Sell amount too small or zero", qty });
       }
-    } else {
-      const qty = parseFloat(amounts.sellAmount);
-      console.log("Computed sell qty:", qty);
-      if (isNaN(qty) || qty <= MIN_ORDER_AMOUNT) {
-        console.error("Computed sell size too small or invalid", { qty, MIN_ORDER_AMOUNT });
-        return res.status(400).json({ error: "Computed sell size too small", qty });
+      // For swap: mark reduceOnly if supported to ensure closing long
+      const extraParams = {};
+      if (EXCHANGE_TYPE === "swap") {
+        extraParams.reduceOnly = true;
       }
-
-      try {
-        const order = await placeMarketOrder(amounts.symbol, "sell", qty);
-        console.log("Sell order full response:", order);
-        try { const openOrders = await exchange.fetchOpenOrders(amounts.symbol); console.log("Open orders after sell:", openOrders); } catch(e){ console.warn("fetchOpenOrders failed:", e && e.toString ? e.toString() : e); }
-        try { if (typeof exchange.fetchPositions === "function") { const pos = await exchange.fetchPositions([amounts.symbol]); console.log("Positions after sell (fetchPositions):", pos); } } catch(e){ console.warn("fetchPositions failed:", e && e.toString ? e.toString() : e); }
-        try { const balAfter = await exchange.fetchBalance(); console.log("Balance after sell (free):", balAfter.free); } catch(e){ console.warn("fetchBalance failed after sell:", e && e.toString ? e.toString() : e); }
-        return res.json({ status: "ok", action: "sell", order });
-      } catch (e) {
-        console.error("createMarketOrder SELL failed:", e && e.toString ? e.toString() : e);
-        return res.status(500).json({ error: "order_failed", detail: e && e.toString ? e.toString() : String(e) });
-      }
+      const order = await placeMarketOrder(symbol, "sell", qty, extraParams);
+      console.log("Sell (close long) order response:", order);
+      return res.json({ ok: true, action: "sell", order });
     }
   } catch (err) {
-    console.error("Webhook handler error:", err && err.toString ? err.toString() : err);
-    return res.status(500).json({ error: err.toString ? err.toString() : String(err) });
+    console.error("Webhook error:", err && err.toString ? err.toString() : err);
+    return res.status(500).json({ error: err && err.toString ? err.toString() : String(err) });
   }
 });
 
-// ---------- START ----------
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`BOT LIVE on port ${port}`));
+// ===== Start =====
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`BOT LIVE on port ${PORT}`));
