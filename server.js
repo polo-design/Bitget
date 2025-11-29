@@ -1,4 +1,4 @@
-// server.js — Bitget-ready webhook bot (ccxt) — enhanced
+// server.js — Bitget-ready webhook bot (ccxt) — final with placeMarketOrder
 import express from "express";
 import bodyParser from "body-parser";
 import ccxt from "ccxt";
@@ -6,7 +6,7 @@ import crypto from "crypto";
 
 const app = express();
 
-// parse bodies as text and json — we will handle both and compute HMAC from stringified body
+// parse bodies as text and json
 app.use(bodyParser.text({ type: "*/*" }));
 app.use(bodyParser.json({ type: "application/json", limit: "100kb" }));
 
@@ -25,9 +25,9 @@ const USE_SANDBOX = (process.env.SANDBOX || "false").toLowerCase() === "true";
 const USE_LEVERAGE_FOR_SWAPS = (process.env.USE_LEVERAGE_FOR_SWAPS || "false").toLowerCase() === "true";
 const LEVERAGE = parseFloat(process.env.LEVERAGE || "1");
 
-// webhook security (optional) — if set, TradingView must send HMAC header 'x-webhook-signature'
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || ""; // set to enable HMAC verification
-const WEBHOOK_HEADER = process.env.WEBHOOK_HEADER || "x-webhook-signature"; // header name to check
+// webhook security (optional)
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || ""; // if set, TradingView must send HMAC in header
+const WEBHOOK_HEADER = process.env.WEBHOOK_HEADER || "x-webhook-signature";
 
 if (!API_KEY || !API_SECRET) {
   console.warn("WARNING: EXCHANGE_KEY / EXCHANGE_SECRET not set — trading will fail until set.");
@@ -53,7 +53,6 @@ try {
   }
   exchange = new ExchangeClass(opts);
 
-  // hint ccxt to use newer API version if supported
   try {
     if (!exchange.options) exchange.options = {};
     exchange.options.defaultType = opts.options.defaultType;
@@ -94,12 +93,10 @@ async function loadMarkets(retry = 0) {
 loadMarkets();
 
 // ---------- DUPLICATE GUARD (in-memory, short TTL) ----------
-const recentPayloads = new Map(); // key -> timestamp
-const DUP_TTL_MS = 30 * 1000; // ignore identical payloads within 30s
-
+const recentPayloads = new Map();
+const DUP_TTL_MS = 30 * 1000;
 function isDuplicate(key) {
   const now = Date.now();
-  // purge old
   for (const [k, t] of recentPayloads.entries()) {
     if (now - t > DUP_TTL_MS) recentPayloads.delete(k);
   }
@@ -127,14 +124,8 @@ async function computeAllInAmounts(marketSymbol) {
   if (!marketsReady) await loadMarkets();
   let symbol = marketSymbol;
 
-  // try to map to actual exchange market key
   if (exchange.markets && !(symbol in exchange.markets)) {
-    const tries = [
-      symbol,
-      symbol.replace("/", ""),
-      symbol.replace("/", "-"),
-      symbol.replace("/", "").replace("-", "")
-    ];
+    const tries = [symbol, symbol.replace("/", ""), symbol.replace("/", "-"), symbol.replace("/", "").replace("-", "")];
     const found = Object.keys(exchange.markets || {}).find(k => tries.includes(k) || tries.includes(k.replace("/", "")));
     if (found) symbol = found;
   }
@@ -142,21 +133,13 @@ async function computeAllInAmounts(marketSymbol) {
   const market = exchange.markets && exchange.markets[symbol] ? exchange.markets[symbol] : null;
 
   let base, quote;
-  if (market) {
-    base = market.base;
-    quote = market.quote;
-  } else {
-    const parts = symbol.split("/");
-    base = parts[0];
-    quote = parts[1];
-  }
+  if (market) { base = market.base; quote = market.quote; }
+  else { const parts = symbol.split("/"); base = parts[0]; quote = parts[1]; }
 
-  // balances
   const bal = await exchange.fetchBalance();
   const freeQuote = (bal[quote] && (bal[quote].free || bal[quote].total)) ? (bal[quote].free || bal[quote].total) : 0;
   const freeBase  = (bal[base]  && (bal[base].free  || bal[base].total)) ? (bal[base].free  || bal[base].total) : 0;
 
-  // price
   const ticker = await exchange.fetchTicker(symbol).catch(e => {
     console.warn("fetchTicker failed for", symbol, e && e.toString ? e.toString() : e);
     return null;
@@ -164,7 +147,6 @@ async function computeAllInAmounts(marketSymbol) {
   const price = ticker && (ticker.last || ticker.close || ticker.bid) ? (ticker.last || ticker.close || ticker.bid) : null;
   if (!price) throw new Error("Cannot fetch price for symbol " + symbol);
 
-  // compute raw amounts
   let rawBuyAmount;
   if (EXCHANGE_TYPE === 'swap' && USE_LEVERAGE_FOR_SWAPS) {
     rawBuyAmount = (freeQuote * SAFETY_BUFFER * LEVERAGE) / price;
@@ -173,7 +155,6 @@ async function computeAllInAmounts(marketSymbol) {
   }
   const rawSellAmount = freeBase * SAFETY_BUFFER;
 
-  // round to exchange precision when possible
   let buyAmount = rawBuyAmount;
   let sellAmount = rawSellAmount;
   try {
@@ -194,28 +175,16 @@ async function computeAllInAmounts(marketSymbol) {
     console.warn("Precision rounding failed:", e && e.toString ? e.toString() : e);
   }
 
-  // If market limits available, ensure we respect minimum
   if (market && market.limits && market.limits.amount && market.limits.amount.min) {
     const minAmt = market.limits.amount.min;
     if (!isNaN(buyAmount) && buyAmount > 0 && buyAmount < minAmt) buyAmount = 0;
     if (!isNaN(sellAmount) && sellAmount > 0 && sellAmount < minAmt) sellAmount = 0;
   }
 
-  return {
-    symbol,
-    base,
-    quote,
-    price,
-    buyAmount,
-    sellAmount,
-    freeQuote,
-    freeBase,
-    rawBuyAmount,
-    rawSellAmount
-  };
+  return { symbol, base, quote, price, buyAmount, sellAmount, freeQuote, freeBase, rawBuyAmount, rawSellAmount };
 }
 
-// optional: attempt to set leverage (best-effort, depends on exchange/ccxt)
+// attempt to set leverage (best-effort)
 async function setLeverageIfNeeded(symbol) {
   if (EXCHANGE_TYPE !== 'swap' || !USE_LEVERAGE_FOR_SWAPS || !LEVERAGE || LEVERAGE <= 1) return;
   try {
@@ -223,11 +192,33 @@ async function setLeverageIfNeeded(symbol) {
       await exchange.setLeverage(LEVERAGE, symbol);
       console.log("setLeverage called via ccxt.setLeverage for", symbol, "=>", LEVERAGE);
     } else {
-      // heuristics for some exchanges may require different calls; we just log and continue
       console.log("exchange.setLeverage not available on this ccxt build — skipping explicit setLeverage");
     }
   } catch (e) {
     console.warn("setLeverage failed (non-fatal):", e && e.toString ? e.toString() : e);
+  }
+}
+
+// robust market order placer (tries createMarketOrder, then fallback to createOrder('market'))
+async function placeMarketOrder(symbol, side, amount) {
+  const params = {};
+  if (EXCHANGE_ID === 'bitget' && EXCHANGE_TYPE === 'swap') {
+    params.orderType = 'market';
+    params.type = 'market';
+  }
+
+  try {
+    if (typeof exchange.createMarketOrder === 'function') {
+      return await exchange.createMarketOrder(symbol, side, amount, params);
+    }
+  } catch (err) {
+    console.warn("createMarketOrder failed, falling back to createOrder('market'):", err && err.toString ? err.toString() : err);
+  }
+
+  try {
+    return await exchange.createOrder(symbol, 'market', side, amount, undefined, params);
+  } catch (err) {
+    throw err;
   }
 }
 
@@ -240,16 +231,7 @@ app.get("/markets", async (_req, res) => {
     const mk = exchange.markets || {};
     const list = Object.keys(mk).map(k => {
       const m = mk[k];
-      return {
-        key: k,
-        id: m.id || null,
-        base: m.base || null,
-        quote: m.quote || null,
-        type: m.type || null,
-        info: m.info || null,
-        precision: m.precision || null,
-        limits: m.limits || null
-      };
+      return { key: k, id: m.id || null, base: m.base || null, quote: m.quote || null, type: m.type || null, info: m.info || null, precision: m.precision || null, limits: m.limits || null };
     });
     return res.json({ count: list.length, markets: list });
   } catch (err) {
@@ -268,12 +250,9 @@ app.get("/balance", async (_req, res) => {
   }
 });
 
-// webhook handler
 app.post("/webhook", async (req, res) => {
   try {
-    // compute string body for HMAC & duplicate check
     const rawText = (typeof req.body === "string") ? req.body : JSON.stringify(req.body || {});
-    // HMAC verification (optional)
     if (WEBHOOK_SECRET) {
       const sig = (req.headers[WEBHOOK_HEADER] || req.headers[WEBHOOK_HEADER.toLowerCase()] || "").toString();
       const computed = computeHmac(WEBHOOK_SECRET, rawText);
@@ -287,14 +266,12 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
-    // duplicate guard
     const dupKey = crypto.createHash("sha256").update(rawText).digest("hex");
     if (isDuplicate(dupKey)) {
       console.log("Duplicate webhook ignored");
       return res.status(200).json({ ok: true, duplicate: true });
     }
 
-    // parse payload (supports JSON or plain text "buy SYMBOL")
     let payload = {};
     if (req.is("application/json") && typeof req.body === "object") {
       payload = req.body;
@@ -322,20 +299,12 @@ app.post("/webhook", async (req, res) => {
 
     const amounts = await computeAllInAmounts(symbol);
 
-    console.log("Webhook:", action, "symbol:", amounts.symbol, "computed:", {
-      buyAmount: amounts.buyAmount,
-      sellAmount: amounts.sellAmount,
-      price: amounts.price,
-      freeQuote: amounts.freeQuote,
-      freeBase: amounts.freeBase,
-      rawBuyAmount: amounts.rawBuyAmount
-    });
+    console.log("Webhook:", action, "symbol:", amounts.symbol, "computed:", { buyAmount: amounts.buyAmount, sellAmount: amounts.sellAmount, price: amounts.price, freeQuote: amounts.freeQuote, freeBase: amounts.freeBase, rawBuyAmount: amounts.rawBuyAmount });
 
     if (!API_KEY || !API_SECRET) {
       return res.status(500).json({ error: "API keys not set in environment" });
     }
 
-    // verify market object & type
     const market = exchange.markets && exchange.markets[amounts.symbol] ? exchange.markets[amounts.symbol] : null;
     console.log("Market check:", { symbol: amounts.symbol, marketType: market && market.type, limits: market && market.limits, precision: market && market.precision });
 
@@ -344,7 +313,6 @@ app.post("/webhook", async (req, res) => {
       return res.status(400).json({ error: "market_type_mismatch", marketType: market.type });
     }
 
-    // attempt to set leverage (best-effort) for swaps
     await setLeverageIfNeeded(amounts.symbol);
 
     if (action === "buy") {
@@ -356,7 +324,7 @@ app.post("/webhook", async (req, res) => {
       }
 
       try {
-        const order = await exchange.createMarketOrder(amounts.symbol, "buy", qty);
+        const order = await placeMarketOrder(amounts.symbol, "buy", qty);
         console.log("Buy order full response:", order);
         try { const openOrders = await exchange.fetchOpenOrders(amounts.symbol); console.log("Open orders after buy:", openOrders); } catch(e){ console.warn("fetchOpenOrders failed:", e && e.toString ? e.toString() : e); }
         try { if (typeof exchange.fetchPositions === "function") { const pos = await exchange.fetchPositions([amounts.symbol]); console.log("Positions after buy (fetchPositions):", pos); } } catch(e){ console.warn("fetchPositions failed:", e && e.toString ? e.toString() : e); }
@@ -375,7 +343,7 @@ app.post("/webhook", async (req, res) => {
       }
 
       try {
-        const order = await exchange.createMarketOrder(amounts.symbol, "sell", qty);
+        const order = await placeMarketOrder(amounts.symbol, "sell", qty);
         console.log("Sell order full response:", order);
         try { const openOrders = await exchange.fetchOpenOrders(amounts.symbol); console.log("Open orders after sell:", openOrders); } catch(e){ console.warn("fetchOpenOrders failed:", e && e.toString ? e.toString() : e); }
         try { if (typeof exchange.fetchPositions === "function") { const pos = await exchange.fetchPositions([amounts.symbol]); console.log("Positions after sell (fetchPositions):", pos); } } catch(e){ console.warn("fetchPositions failed:", e && e.toString ? e.toString() : e); }
